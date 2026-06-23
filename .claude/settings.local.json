@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -c \"import vision_pipeline, simple_jenga_grab, stack_grab, live_stack_grab; print\\('imports OK'\\)\")"
+    ]
+  }
+}
