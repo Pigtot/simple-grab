@@ -1,5 +1,4 @@
 """
-Minimal OpenCV vision pipeline for one real Jenga block.
 
 Input:
     - BGR color image from RealSense

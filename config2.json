@@ -2,8 +2,8 @@
   "robot": {
     "ip": "192.168.1.217",
     "safe_z_mm": 150.0,
-    "move_speed": 100,
-    "approach_speed": 50,
+    "move_speed": 150,
+    "approach_speed": 75,
     "collision_sensitivity": 3,
     "tcp_load_kg": 0.82,
     "tcp_load_center_mm": [0.0, 0.0, 48.0]
@@ -20,10 +20,10 @@
     "warmup_frames": 30
   },
   "vision": {
-    "min_score": 0.3,
+    "min_score": 0.35,
     "min_depth_m": 0.2,
     "max_depth_m": 1.0,
-    "edge_margin_px": 15,
+    "edge_margin_px": 10,
     "min_area_px": 500
   },
   "calibration": {
@@ -50,7 +50,7 @@
   },
   "grasp": {
     "pick_z_offset_mm": 0.0,
-    "place_xyz_mm": [250.0,-50.0,-109],
+    "place_xyz_mm": [250.0,-50.0,-78],
     "block_length_mm": 75.0,
     "block_width_mm": 25.0,
     "block_height_mm": 15.0,

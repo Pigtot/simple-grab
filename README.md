@@ -49,8 +49,12 @@ at the tuned config with `--config config2.json`.
 
 ### Live preview stacking (recommended)
 
-Opens a live RealSense window with the detection overlay. Press **`g`** to pick the
-shown block and place it on the growing stack; **`q`** or **`Esc`** to quit.
+Opens a live RealSense window and automatically picks eligible blocks using
+`config2.json` by default. **Space** pauses after the current cycle or resumes;
+**`g`** picks once while paused; **`q`** or **`Esc`** stops motion and exits.
+Use `--manual` to start paused, or `--stack-count N` for an existing stack.
+On macOS, use `sudo .venv/bin/python live_stack_grab.py` if the RealSense driver
+reports `failed to set power state`.
 
 ```powershell
 python live_stack_grab.py --config config2.json
@@ -114,7 +118,7 @@ RealSense frame ──► OpenCV detect ──► camera→robot transform ─�
 | `vision_pipeline.py` | OpenCV block detector + pixel/depth → 3D camera point. The vision core. |
 | `simple_jenga_grab.py` | Shared library (RealSense capture, xArm helpers, eye-in-hand transform) **plus** a one-shot single-grab `main()`. |
 | `stack_grab.py` | Keyboard-driven continuous stacking. |
-| `live_stack_grab.py` | **Primary entry point** — live OpenCV preview; press `g` to grab/stack. |
+| `live_stack_grab.py` | **Primary entry point** — continuous automatic stacking with live preview and pause/stop controls. |
 | `calibrate.py` | Fixed-camera point-pair calibration only. Not used in eye-in-hand mode. |
 | `config2.json` | **Tuned config** used by the stacking scripts. |
 | `config.json` | Legacy single-grab config. Ignored. |
@@ -218,7 +222,7 @@ Notes:
 
 ## Debug images
 
-Each grab writes to `grab_debug/`: `color.png`, `depth_raw.png`, `mask.png`,
+With `--save-debug`, the live runner writes each grab to `grab_debug/` (the other grab scripts save by default): `color.png`, `depth_raw.png`, `mask.png`,
 `detection.png`, plus numbered copies (`detection_001.png`, …). Check these if the
 robot misses or chooses the wrong block.
 

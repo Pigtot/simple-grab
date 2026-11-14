@@ -149,7 +149,7 @@ def detect_block(config, config_dir, debug_index):
     return best
 
 
-def compute_pick(config, config_dir, best, capture_pose):
+def compute_pick(config, config_dir, best, capture_pose, verbose=True):
     pick_z_offset = float(config["grasp"].get("pick_z_offset_mm", 0.0))
     wrist_grasp_offset = get_wrist_grasp_offset_deg(config)
     table_z = float(config["grasp"].get("table_z_mm", config["grasp"]["place_xyz_mm"][2]))
@@ -175,6 +175,8 @@ def compute_pick(config, config_dir, best, capture_pose):
 
     robot_xyz_before_offset = [float(value) for value in robot_xyz]
     robot_xyz[2] += pick_z_offset
+    if not verbose:
+        return robot_xyz, robot_yaw
     print(
         "  Pick Z: "
         f"transformed_z={robot_xyz_before_offset[2]:.1f} mm, "
