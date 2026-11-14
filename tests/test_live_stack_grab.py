@@ -58,21 +58,31 @@ class LiveTests(unittest.TestCase):
             stream.stop()
             pipeline.stop.assert_not_called()
 
-    def test_camera_with_no_frames_is_reset_once_then_started(self):
-        with patch.object(live.rs, 'pipeline') as pipeline_factory, \
+    def start_stream_without_frames(self, env):
+        with patch.dict(live.os.environ, env, clear=False), \
+             patch.object(live.rs, 'pipeline') as pipeline_factory, \
              patch.object(live.rs, 'config'), patch.object(live.rs, 'align'), \
-             patch.object(live.time, 'sleep'), \
              patch.object(live, 'wait_for_realsense_frames',
-                          side_effect=[RuntimeError('RealSense frame timeout')] + [Mock()] * 100), \
-             patch.object(live, 'get_realsense_intrinsics', return_value=dict(fx=1, fy=1)), \
-             patch.object(live.RealSenseLiveStream, '_decode', return_value=(np.zeros((2, 2, 3)), None, None)):
+                          side_effect=RuntimeError('RealSense frame timeout')):
             pipeline = pipeline_factory.return_value
             device = pipeline.start.return_value.get_device.return_value
-            device.first_depth_sensor.return_value.get_depth_scale.return_value = 0.001
-            live.RealSenseLiveStream(self.config).start()
-        device.hardware_reset.assert_called_once()
+            if not env:
+                live.os.environ.pop(live.CAMERA_RESET_ENV, None)
+            try:
+                live.RealSenseLiveStream(self.config).start()
+            except RuntimeError as exc:
+                return exc, pipeline, device
+
+    def test_camera_with_no_frames_is_reset_then_process_restarts(self):
+        exc, pipeline, device = self.start_stream_without_frames({})
+        self.assertIsInstance(exc, live.CameraResetRestart)
         pipeline.stop.assert_called_once()
-        self.assertEqual(pipeline.start.call_count, 2)
+        device.hardware_reset.assert_called_once()
+
+    def test_camera_reset_happens_only_once(self):
+        exc, _, device = self.start_stream_without_frames({live.CAMERA_RESET_ENV: '1'})
+        self.assertIsInstance(exc, live.CameraStartupError)
+        device.hardware_reset.assert_not_called()
 
     def test_failed_camera_does_not_connect_arm(self):
         stream = Mock()
@@ -121,6 +131,40 @@ class LiveTests(unittest.TestCase):
         self.assertEqual([status for _, status in labeled],
                          ['out_of_range', 'stack_zone', 'invalid', live.PICKABLE])
         self.assertIs(live.first_pickable(labeled), candidates[3])
+
+    def test_console_tail_keeps_complete_lines_and_still_prints(self):
+        terminal = Mock()
+        tail = live.ConsoleTail(terminal, lines=live.deque(maxlen=10))
+        tail.write("  Motion 1/9")
+        tail.write(": open gripper\n[Grab 2] next\npartial")
+        self.assertEqual(list(tail.lines), ["  Motion 1/9: open gripper", "[Grab 2] next"])
+        self.assertEqual(terminal.write.call_count, 2)
+
+    def test_dashboard_fills_macbook_screen_layout(self):
+        depth = np.full((720, 1280), 400, np.uint16)
+        depth[300:400, 400:800] = 385  # a block 15 mm above the table
+        depth[100:120, 100:120] = 0  # no depth reading (shadow)
+        mask = np.zeros((720, 1280), np.uint8)
+        mask[300:400, 400:800] = 255
+        live_panel, depth_panel = live.make_panels(np.zeros((720, 1280, 3), np.uint8), mask, depth)
+        canvas = live.compose_dashboard(live_panel, depth_panel, "x" * 300, (0, 0, 255),
+                                        ["line"] * 500 + ["y" * 400])
+        self.assertEqual(canvas.shape, (live.DASHBOARD_H, live.DASHBOARD_W, 3))
+        top = live.TOP_BAR_PX + live.PANEL_H  # depth panel sits under the live view
+        block, table = canvas[top + 262, 450], canvas[top + 50, 50]
+        self.assertFalse((block == table).all())  # the block stands out in the heatmap
+        self.assertTrue((canvas[top + 82, 82] == 255).all())  # blank depth is white
+        self.assertTrue((canvas[top + 225, 320:580] == live.DETECTED_BGR).all(axis=-1).any())
+
+    def test_depth_colors_give_near_distances_more_resolution(self):
+        index = live._depth_color_index(np.array([0.0, 0.1, 0.9, 1.0])).astype(int)
+        self.assertEqual((index[0], index[-1]), (255, 0))  # red = nearest
+        self.assertGreater(index[0] - index[1], 2 * (index[2] - index[3]))
+
+    def test_depth_panel_is_live_without_a_mask(self):
+        _, depth_panel = live.make_panels(np.zeros((720, 1280, 3), np.uint8), None,
+                                          np.full((720, 1280), 400, np.uint16))
+        self.assertTrue(depth_panel.any())  # robot moving: heatmap still shown
 
     def test_draws_every_labeled_candidate(self):
         image = np.zeros((240, 320, 3), dtype=np.uint8)

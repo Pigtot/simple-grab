@@ -8,10 +8,12 @@ g requests one pick while paused; q/Esc stops motion and exits.
 import argparse
 import os
 import sys
+import textwrap
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from threading import Event
+from threading import Event, Lock
 from types import SimpleNamespace
 
 import cv2
@@ -50,7 +52,12 @@ DEFAULT_LIVE_HEIGHT = 720
 DEFAULT_FAST_MOVE_SPEED = 180.0
 DEFAULT_FAST_SPEED_MIN_CLEARANCE_MM = 35.0
 DEFAULT_CONFIG = Path(__file__).resolve().with_name("config2.json")
-OVERLAY_BAR_PX = 28
+# 16" MacBook Pro default "looks like" resolution; fullscreen scales it to the panel.
+DASHBOARD_W, DASHBOARD_H = 1728, 1117
+TOP_BAR_PX = 36
+PANEL_H = (DASHBOARD_H - TOP_BAR_PX) // 2  # live view on top, mask below
+CONTROLS_TEXT = "Space: pause/resume    g: one pick    f: fullscreen    q/Esc: stop"
+CONSOLE_LINES = deque(maxlen=400)  # recent stdout lines, shown in the right panel
 
 PICKABLE = "pickable"
 # Status -> (BGR outline/text color, short label). "target" is the block the
@@ -68,8 +75,35 @@ class MotionStopped(RuntimeError):
     pass
 
 
+class ConsoleTail:
+    """Tee stdout to the terminal and keep recent lines for the on-screen log."""
+
+    def __init__(self, stream, lines=CONSOLE_LINES):
+        self.stream = stream
+        self.lines = lines
+        self._partial = ""
+        self._lock = Lock()  # the motion worker prints too
+
+    def write(self, text):
+        with self._lock:
+            self.stream.write(text)
+            *done, self._partial = (self._partial + text).split("\n")
+            self.lines.extend(done)
+        return len(text)
+
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
+
+
 class CameraStartupError(RuntimeError):
     """Native camera startup failed before the arm was connected."""
+
+
+class CameraResetRestart(RuntimeError):
+    """The camera was hardware-reset; a fresh process is needed to reopen it."""
+
+
+CAMERA_RESET_ENV = "LIVE_STACK_CAMERA_RESET"
 
 
 def report_camera_startup_error(error):
@@ -166,11 +200,11 @@ def select_pickable_candidate(candidates, config, config_dir, capture_pose):
 
 
 def _draw_tag(image, text, origin, color):
-    font, scale, thickness = cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1
+    font, scale, thickness = cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2  # stays readable once scaled into the panel
     (text_w, text_h), baseline = cv2.getTextSize(text, font, scale, thickness)
     height, width = image.shape[:2]
     x = int(np.clip(origin[0], 2, max(width - text_w - 4, 2)))
-    y = int(np.clip(origin[1], OVERLAY_BAR_PX + text_h + 6, max(height - baseline - 2, 0)))
+    y = int(np.clip(origin[1], text_h + 6, max(height - baseline - 2, 0)))
     cv2.rectangle(image, (x - 2, y - text_h - 4), (x + text_w + 2, y + baseline + 2), (20, 20, 20), -1)
     cv2.putText(image, text, (x, y), font, scale, color, thickness, cv2.LINE_AA)
 
@@ -284,19 +318,23 @@ class RealSenseLiveStream:
         self.depth_scale_m = None
 
     def start(self):
+        already_reset = bool(os.environ.get(CAMERA_RESET_ENV))
         try:
-            self._open_and_warm_up()
+            # Right after a reset the camera may still be re-enumerating.
+            self._open_and_warm_up(start_attempts=10 if already_reset else 1)
         except CameraStartupError:
             raise
         except RuntimeError as exc:
+            if already_reset:
+                raise CameraStartupError(str(exc)) from exc
             # A D435 left mid-stream by a previous run (common on macOS) opens
-            # but never sends frames. A hardware reset clears it.
-            print(f"  {exc}\n  Resetting the camera once and retrying...")
+            # but never sends frames. A hardware reset clears it, but macOS
+            # cannot reopen the camera in the same process afterwards.
+            print(f"  {exc}\n  Resetting the camera and restarting once...", flush=True)
             device = self.profile.get_device()
             self.stop()
             device.hardware_reset()
-            time.sleep(3.0)  # the camera drops off USB and re-enumerates
-            self._open_and_warm_up(start_attempts=10)
+            raise CameraResetRestart() from exc
 
         color, _, color_frame = self.read(include_frame=True)
         self.intrinsics = get_realsense_intrinsics(color_frame)
@@ -367,17 +405,68 @@ class RealSenseLiveStream:
             self.started = False
 
 
-def side_by_side_mask(preview, mask):
-    """Put the segmentation mask (black = blank while not processing) right of the preview."""
-    if mask is None or mask.shape[:2] != preview.shape[:2]:
-        mask_bgr = np.zeros_like(preview)
-    else:
-        mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
-    return np.hstack((preview, mask_bgr))
+DETECTED_BGR = (255, 0, 255)  # magenta: not in the depth colormap, not the white of "no depth"
 
 
-def draw_live_overlay(preview, best, stack_count, busy=False, automatic=True, message=None):
-    """One thin status line; key help is printed in the terminal at startup."""
+def _depth_color_index(fraction):
+    """0 = nearest, 1 = farthest -> colormap index (255 = red). sqrt gives near distances more colors."""
+    return ((1.0 - np.sqrt(fraction)) * 255).astype(np.uint8)
+
+
+def _draw_depth_legend(panel, near, far):
+    """Color bar labeled in mm; evenly spaced distances spread out near and bunch up far."""
+    font, height, width = cv2.FONT_HERSHEY_SIMPLEX, panel.shape[0], panel.shape[1]
+    top = height - 34
+    panel[top:] = (24, 24, 24)
+    x0, x1 = 12, width - 240
+    bar = _depth_color_index(np.linspace(0.0, 1.0, x1 - x0) ** 2)  # column -> fraction, inverted
+    panel[top + 5:top + 15, x0:x1] = cv2.applyColorMap(bar.reshape(1, -1), cv2.COLORMAP_TURBO)
+    for fraction in (0.0, 0.25, 0.5, 0.75, 1.0):
+        x = x0 + int(np.sqrt(fraction) * (x1 - x0 - 1))
+        label = f"{near + fraction * (far - near):.0f}"
+        text_w = cv2.getTextSize(label, font, 0.4, 1)[0][0]
+        cv2.line(panel, (x, top + 15), (x, top + 19), (230, 230, 230), 1)
+        cv2.putText(panel, label, (int(np.clip(x - text_w // 2, 2, width - text_w - 2)), top + 30),
+                    font, 0.4, (230, 230, 230), 1, cv2.LINE_AA)
+    cv2.putText(panel, "mm   magenta = detected", (x1 + 14, top + 22),
+                font, 0.42, (230, 230, 230), 1, cv2.LINE_AA)
+
+
+def depth_heatmap(depth, mask, size):
+    """Live depth heatmap: red = near, white = no depth reading, magenta = detected regions."""
+    depth = cv2.resize(depth, size, interpolation=cv2.INTER_NEAREST)
+    valid = depth > 0
+    heat = np.full((size[1], size[0], 3), 255, np.uint8)
+    near = far = None
+    if valid.any():
+        # Stretch colors over this frame's depth spread; a block is only ~15 mm tall.
+        near, far = (float(value) for value in np.percentile(depth[valid][::16], (2, 98)))
+        far = max(far, near + 1.0)
+        fraction = np.clip((depth.astype(np.float32) - near) / (far - near), 0.0, 1.0)
+        heat = cv2.applyColorMap(_depth_color_index(fraction), cv2.COLORMAP_TURBO)
+        heat[~valid] = 255
+    if mask is not None:
+        mask = cv2.resize(mask, size, interpolation=cv2.INTER_NEAREST)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(heat, contours, -1, DETECTED_BGR, 2)
+    if near is not None:
+        _draw_depth_legend(heat, near, far)
+    return heat
+
+
+def make_panels(live, mask, depth=None, panel_h=PANEL_H):
+    """Scale the labeled live frame to panel size and build the depth panel under it."""
+    height, width = live.shape[:2]
+    size = (round(panel_h * width / height), panel_h)
+    live_panel = cv2.resize(live, size, interpolation=cv2.INTER_AREA)
+    if depth is None or depth.shape[:2] != (height, width):
+        return live_panel, np.zeros_like(live_panel)
+    if mask is not None and mask.shape[:2] != (height, width):
+        mask = None
+    return live_panel, depth_heatmap(depth, mask, size)
+
+
+def live_status(best, stack_count, busy=False, automatic=True, message=None):
     if best is None:
         status, color = "No valid Jenga block detected", (0, 0, 255)
     else:
@@ -387,11 +476,47 @@ def draw_live_overlay(preview, best, stack_count, busy=False, automatic=True, me
         color = (0, 180, 255)
     if message:
         status = message
+    return f"{'AUTO' if automatic else 'PAUSED'} | Stack {stack_count} | {status}", color
 
-    text = f"{'AUTO' if automatic else 'PAUSED'} | Stack {stack_count} | {status}"
-    cv2.rectangle(preview, (0, 0), (preview.shape[1], OVERLAY_BAR_PX), (20, 20, 20), -1)
-    cv2.putText(preview, text, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1, cv2.LINE_AA)
-    return preview
+
+def _log_color(line):
+    lowered = line.lower()
+    if any(word in lowered for word in ("stopped", "fault", "error", "failed", "timeout")):
+        return (90, 90, 255)
+    if line.startswith("[Grab") or "stack count" in lowered:
+        return (120, 220, 120)
+    return (210, 210, 210)
+
+
+def compose_dashboard(live_panel, mask_panel, status, status_color, log_lines):
+    """Top bar: status and controls. Left: live over mask. Right: recent program output."""
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    canvas = np.full((DASHBOARD_H, DASHBOARD_W, 3), 24, dtype=np.uint8)
+
+    (controls_w, _), _ = cv2.getTextSize(CONTROLS_TEXT, font, 0.55, 1)
+    cv2.putText(canvas, CONTROLS_TEXT, (DASHBOARD_W - controls_w - 12, 24),
+                font, 0.55, (230, 230, 230), 1, cv2.LINE_AA)
+    room = DASHBOARD_W - controls_w - 40
+    status_w = cv2.getTextSize(status, font, 0.6, 1)[0][0]
+    if status_w > room:  # long fault text; the full message is in the log panel
+        status = status[:max(int(len(status) * room / status_w) - 3, 0)] + "..."
+    cv2.putText(canvas, status, (12, 24), font, 0.6, status_color, 1, cv2.LINE_AA)
+
+    panel_h, panel_w = live_panel.shape[:2]
+    canvas[TOP_BAR_PX:TOP_BAR_PX + panel_h, :panel_w] = live_panel
+    canvas[TOP_BAR_PX + panel_h:TOP_BAR_PX + 2 * panel_h, :panel_w] = mask_panel
+
+    # Terminal panel: newest output at the bottom, wrapped to the panel width.
+    x0, scale, line_h = panel_w + 12, 0.45, 18
+    char_w = cv2.getTextSize("0" * 10, font, scale, 1)[0][0] / 10.0
+    max_chars = max(int((DASHBOARD_W - x0 - 8) / char_w), 20)
+    rows = (DASHBOARD_H - TOP_BAR_PX - 10) // line_h
+    wrapped = [part for line in list(log_lines)[-rows:]
+               for part in (textwrap.wrap(line, max_chars, subsequent_indent="      ") or [""])][-rows:]
+    for row, line in enumerate(wrapped):
+        y = TOP_BAR_PX + 16 + row * line_h
+        cv2.putText(canvas, line, (x0, y), font, scale, _log_color(line.strip()), 1, cv2.LINE_AA)
+    return canvas
 
 
 def copy_config_with_move_speed(config, move_speed):
@@ -512,7 +637,7 @@ def run_preview(arm, stream, pipeline, config, config_dir, args):
     settle_until = float("inf")
     capture_pose = None
     last_frame_at = time.monotonic()
-    preview = np.zeros((config["camera"]["height"], 2 * config["camera"]["width"], 3), dtype=np.uint8)
+    panels = make_panels(np.zeros((config["camera"]["height"], config["camera"]["width"], 3), np.uint8), None)
     best = None
     labeled = []
     mask = None
@@ -566,7 +691,7 @@ def run_preview(arm, stream, pipeline, config, config_dir, args):
                     ready = gate.update(best)
                 else:
                     gate.reset()
-                preview = side_by_side_mask(draw_labeled_candidates(color, labeled, best), mask)
+                panels = make_panels(draw_labeled_candidates(color, labeled, best), mask, depth)
             elif now - last_frame_at > float(config["camera"].get("frame_timeout_ms", 5000)) / 1000.0:
                 raise RuntimeError("Camera stopped delivering frames")
 
@@ -580,14 +705,18 @@ def run_preview(arm, stream, pipeline, config, config_dir, args):
             elif best is None and future is None:
                 message = (f"{len(labeled)} block(s) seen, none pickable outside the stack area"
                            if labeled else "Watching for a pickable block outside the stack area...")
-            cv2.imshow(WINDOW_NAME, draw_live_overlay(
-                preview.copy(), best, stack_count, busy=future is not None,
-                automatic=automatic, message=message,
-            ))
+            status, status_color = live_status(
+                best, stack_count, busy=future is not None, automatic=automatic, message=message,
+            )
+            cv2.imshow(WINDOW_NAME, compose_dashboard(*panels, status, status_color, CONSOLE_LINES))
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), 27) or cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
                 print("  Quit requested.")
                 break
+            if key == ord("f"):
+                fullscreen = cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN) == cv2.WINDOW_FULLSCREEN
+                cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN,
+                                      cv2.WINDOW_NORMAL if fullscreen else cv2.WINDOW_FULLSCREEN)
             if key == ord(" ") and fault is None:
                 automatic = not automatic
                 gate.reset()
@@ -646,7 +775,7 @@ def main():
         "--preview-scale",
         type=float,
         default=1.0,
-        help="Scale the preview window without changing camera resolution.",
+        help="Window size, relative to 1728x1117, when not fullscreen (toggle with f).",
     )
     parser.add_argument(
         "--fast-move-speed",
@@ -692,7 +821,8 @@ def main():
     print("  Mode: " + ("camera test only (no robot connection)" if args.camera_only else
                         "manual / paused" if args.manual else "continuous automatic stacking"))
     if not args.camera_only:
-        print("  Space: pause after current cycle / resume; g: one pick while paused; q/Esc: stop and quit.")
+        print("  Space: pause after current cycle / resume; g: one pick while paused; "
+              "f: fullscreen; q/Esc: stop and quit.")
 
     if not args.camera_only and is_eye_in_hand_setup(config):
         tcp_from_camera_transform(config)
@@ -718,13 +848,13 @@ def main():
             depth_scale_m=stream.depth_scale_m,
             config=config["vision"],
         )
-        cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
-        # The preview is two frames wide; keep its aspect at one frame's width on screen.
-        cv2.resizeWindow(
+        cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
+        cv2.resizeWindow(  # size used when leaving fullscreen with f
             WINDOW_NAME,
-            int(stream.intrinsics["width"] * args.preview_scale),
-            int(stream.intrinsics["height"] * args.preview_scale / 2),
+            int(DASHBOARD_W * args.preview_scale),
+            int(DASHBOARD_H * args.preview_scale),
         )
+        cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
         return run_preview(arm, stream, pipeline, config, config_dir, args)
     finally:
         try:
@@ -737,8 +867,17 @@ def main():
 
 
 if __name__ == "__main__":
+    sys.stdout = ConsoleTail(sys.stdout)  # mirror prints into the dashboard log panel
     try:
         exit_code = main()
+    except CameraResetRestart:
+        # The arm is never connected before the camera starts, so restarting is
+        # safe. execv also skips the native driver's crash-prone teardown.
+        time.sleep(3.0)  # the camera drops off USB and re-enumerates
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os.environ[CAMERA_RESET_ENV] = "1"
+        os.execv(sys.executable, [sys.executable, os.path.abspath(sys.argv[0]), *sys.argv[1:]])
     except CameraStartupError as exc:
         report_camera_startup_error(exc)
         # This macOS native driver has crashed during destruction after a failed

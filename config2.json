@@ -2,8 +2,8 @@
   "robot": {
     "ip": "192.168.1.217",
     "safe_z_mm": 150.0,
-    "move_speed": 150,
-    "approach_speed": 75,
+    "move_speed": 300,
+    "approach_speed": 150,
     "collision_sensitivity": 3,
     "tcp_load_kg": 0.82,
     "tcp_load_center_mm": [0.0, 0.0, 48.0]
