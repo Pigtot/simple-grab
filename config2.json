@@ -3,7 +3,7 @@
     "ip": "192.168.1.217",
     "safe_z_mm": 150.0,
     "move_speed": 300,
-    "approach_speed": 150,
+    "approach_speed": 200,
     "collision_sensitivity": 3,
     "tcp_load_kg": 0.82,
     "tcp_load_center_mm": [0.0, 0.0, 48.0]
@@ -50,7 +50,7 @@
   },
   "grasp": {
     "pick_z_offset_mm": 0.0,
-    "place_xyz_mm": [250.0,-50.0,-78],
+    "place_xyz_mm": [250.0,-50.0,-77],
     "block_length_mm": 75.0,
     "block_width_mm": 25.0,
     "block_height_mm": 15.0,

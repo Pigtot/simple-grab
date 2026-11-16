@@ -25,10 +25,17 @@ to a USB 3 port. Verify camera access separately before restarting stacking:
 sudo .venv/bin/python live_stack_grab.py --camera-only
 ```
 
+Run only one camera session at a time. If startup says `UVC device is already
+opened`, quit the existing preview with `q`/Esc or stop the old Terminal run
+before starting another instance or a camera-only test. A failed partial startup
+can also retain a camera stream until its process exits.
+
 This opens the color/depth streams, checks for valid depth pixels, and exits
 without connecting to or moving the arm. Add `--camera-debug` if it still fails.
-On the observed macOS power-state failure, the command exits without running
-native-driver destructors, which previously segfaulted during shutdown. This
+On macOS camera-startup failures, the command exits without running native-driver
+destructors, which have crashed or left streaming threads during shutdown. After
+a hardware reset, startup retries only a missing device while USB re-enumerates;
+it does not retry busy or partially opened pipelines. This
 error handling does not repair a USB connection or reset the device.
 
 Startup checks the camera, connects to the arm without clearing existing

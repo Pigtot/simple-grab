@@ -106,8 +106,24 @@ class CameraResetRestart(RuntimeError):
 CAMERA_RESET_ENV = "LIVE_STACK_CAMERA_RESET"
 
 
+def camera_is_busy(error):
+    message = str(error).lower()
+    return "already opened" in message or "device or resource busy" in message
+
+
 def report_camera_startup_error(error):
     print(f"\nCamera startup failed: {error}", file=sys.stderr, flush=True)
+    if camera_is_busy(error):
+        print(
+            "This instance did not connect to or move the robot.\n"
+            "The camera is already open in another session or a partially started driver.\n"
+            "Quit the existing Live Stack Grab preview with q/Esc, or close the\n"
+            "other camera application, before launching again. Run only one instance.\n"
+            "If no working preview exists, stop the old Terminal run with Ctrl+C.\n"
+            "Reconnect USB only after the old camera process has exited.",
+            file=sys.stderr, flush=True,
+        )
+        return
     print(
         "The robot was not connected or moved.\n"
         "Close other camera applications, unplug the D435 for 10 seconds,\n"
@@ -325,7 +341,7 @@ class RealSenseLiveStream:
         except CameraStartupError:
             raise
         except RuntimeError as exc:
-            if already_reset:
+            if already_reset or camera_is_busy(exc):
                 raise CameraStartupError(str(exc)) from exc
             # A D435 left mid-stream by a previous run (common on macOS) opens
             # but never sends frames. A hardware reset clears it, but macOS
@@ -355,7 +371,11 @@ class RealSenseLiveStream:
                 self.profile = self.pipeline.start(self.rs_config)
                 break
             except RuntimeError as exc:
-                if attempt == start_attempts:
+                # Only missing-device errors justify waiting for re-enumeration.
+                # Retrying a partially opened pipeline can leave UVC streaming
+                # and turn the original error into "already opened".
+                missing_device = "no device connected" in str(exc).lower()
+                if attempt == start_attempts or not missing_device:
                     raise CameraStartupError(str(exc)) from exc
                 time.sleep(1.0)
         self.started = True
@@ -880,10 +900,10 @@ if __name__ == "__main__":
         os.execv(sys.executable, [sys.executable, os.path.abspath(sys.argv[0]), *sys.argv[1:]])
     except CameraStartupError as exc:
         report_camera_startup_error(exc)
-        # This macOS native driver has crashed during destruction after a failed
-        # USB power-state transition. No arm has been connected on this path.
+        # The macOS native driver can crash or hang streaming during destruction
+        # after partial startup. No arm has been connected on this path.
         # Keep the exception/traceback alive and let the OS release USB handles.
-        if sys.platform == "darwin" and "failed to set power state" in str(exc).lower():
+        if sys.platform == "darwin":
             sys.stdout.flush()
             sys.stderr.flush()
             os._exit(1)

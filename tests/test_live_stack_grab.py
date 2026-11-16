@@ -84,6 +84,41 @@ class LiveTests(unittest.TestCase):
         self.assertIsInstance(exc, live.CameraStartupError)
         device.hardware_reset.assert_not_called()
 
+    def test_busy_camera_is_not_retried_after_reset(self):
+        with patch.dict(live.os.environ, {live.CAMERA_RESET_ENV: '1'}), \
+             patch.object(live.rs, 'pipeline') as pipeline_factory, \
+             patch.object(live.rs, 'config'), patch.object(live.rs, 'align'), \
+             patch.object(live.time, 'sleep') as sleep:
+            pipeline = pipeline_factory.return_value
+            pipeline.start.side_effect = RuntimeError('UVC device is already opened!')
+            with self.assertRaises(live.CameraStartupError):
+                live.RealSenseLiveStream(self.config).start()
+            pipeline.start.assert_called_once()
+            sleep.assert_not_called()
+
+    def test_missing_camera_can_reenumerate_after_reset(self):
+        with patch.object(live.rs, 'pipeline') as pipeline_factory, \
+             patch.object(live.rs, 'config'), patch.object(live.rs, 'align'), \
+             patch.object(live.time, 'sleep') as sleep, \
+             patch.object(live, 'wait_for_realsense_frames'):
+            pipeline = pipeline_factory.return_value
+            profile = Mock()
+            pipeline.start.side_effect = [RuntimeError('No device connected'), profile]
+            stream = live.RealSenseLiveStream(self.config)
+            stream._open_and_warm_up(start_attempts=10)
+            self.assertIs(stream.profile, profile)
+            self.assertTrue(stream.started)
+            self.assertEqual(pipeline.start.call_count, 2)
+            sleep.assert_called_once_with(1.0)
+
+    def test_busy_message_does_not_advise_opening_second_camera_test(self):
+        import io
+        stderr = io.StringIO()
+        with patch.object(live.sys, 'stderr', stderr):
+            live.report_camera_startup_error(RuntimeError('UVC device is already opened!'))
+        self.assertIn('Run only one instance', stderr.getvalue())
+        self.assertNotIn('--camera-only', stderr.getvalue())
+
     def test_failed_camera_does_not_connect_arm(self):
         stream = Mock()
         stream.start.side_effect = live.CameraStartupError('failed to set power state')
